@@ -3,7 +3,6 @@ package auth
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -51,77 +50,6 @@ func (p *PostgresStore) GetOrCreateUser(ctx context.Context, workosID, email str
 		return "", fmt.Errorf("auth: get or create user: %w", err)
 	}
 	return userID, nil
-}
-
-func (p *PostgresStore) CreateDeviceFlowSession(ctx context.Context, session *DeviceFlowSession) error {
-	_, err := p.pool.Exec(ctx, `
-		INSERT INTO llmlens.device_flow_sessions
-			(device_code, user_code, device_fingerprint, device_name, status, expires_at, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`, session.DeviceCode, session.UserCode, session.DeviceFingerprint,
-		session.DeviceName, session.Status, session.ExpiresAt, session.CreatedAt)
-	if err != nil {
-		return fmt.Errorf("auth: create device flow session: %w", err)
-	}
-	return nil
-}
-
-func (p *PostgresStore) GetDeviceFlowByDeviceCode(ctx context.Context, deviceCode string) (*DeviceFlowSession, error) {
-	return p.scanDeviceFlowSession(ctx, `
-		SELECT id, device_code, user_code, device_fingerprint, device_name, status, user_id, expires_at, created_at
-		FROM llmlens.device_flow_sessions
-		WHERE device_code = $1
-	`, deviceCode)
-}
-
-func (p *PostgresStore) GetDeviceFlowByUserCode(ctx context.Context, userCode string) (*DeviceFlowSession, error) {
-	return p.scanDeviceFlowSession(ctx, `
-		SELECT id, device_code, user_code, device_fingerprint, device_name, status, user_id, expires_at, created_at
-		FROM llmlens.device_flow_sessions
-		WHERE user_code = $1
-	`, userCode)
-}
-
-func (p *PostgresStore) scanDeviceFlowSession(ctx context.Context, query string, args ...any) (*DeviceFlowSession, error) {
-	s := &DeviceFlowSession{}
-	var userID *string
-	err := p.pool.QueryRow(ctx, query, args...).Scan(
-		&s.ID, &s.DeviceCode, &s.UserCode, &s.DeviceFingerprint,
-		&s.DeviceName, &s.Status, &userID, &s.ExpiresAt, &s.CreatedAt,
-	)
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			return nil, fmt.Errorf("auth: device flow session not found: %w", err)
-		}
-		return nil, fmt.Errorf("auth: scan device flow session: %w", err)
-	}
-	if userID != nil {
-		s.UserID = *userID
-	}
-	return s, nil
-}
-
-func (p *PostgresStore) CompleteDeviceFlow(ctx context.Context, deviceCode, userID string) error {
-	_, err := p.pool.Exec(ctx, `
-		UPDATE llmlens.device_flow_sessions
-		SET status = 'complete', user_id = $2
-		WHERE device_code = $1 AND status = 'pending'
-	`, deviceCode, userID)
-	if err != nil {
-		return fmt.Errorf("auth: complete device flow: %w", err)
-	}
-	return nil
-}
-
-func (p *PostgresStore) CleanupExpiredDeviceFlows(ctx context.Context) error {
-	_, err := p.pool.Exec(ctx, `
-		DELETE FROM llmlens.device_flow_sessions
-		WHERE expires_at < $1
-	`, time.Now())
-	if err != nil {
-		return fmt.Errorf("auth: cleanup expired device flows: %w", err)
-	}
-	return nil
 }
 
 func (p *PostgresStore) RegisterDevice(ctx context.Context, licenseID, fingerprint, name, email string) error {
@@ -175,6 +103,17 @@ func (p *PostgresStore) GetRefreshToken(ctx context.Context, tokenHash string) (
 		return nil, fmt.Errorf("auth: get refresh token: %w", err)
 	}
 	return t, nil
+}
+
+func (p *PostgresStore) RevokeRefreshToken(ctx context.Context, tokenHash string) error {
+	_, err := p.pool.Exec(ctx, `
+		UPDATE llmlens.refresh_tokens SET revoked_at = NOW()
+		WHERE token_hash = $1 AND revoked_at IS NULL
+	`, tokenHash)
+	if err != nil {
+		return fmt.Errorf("auth: revoke refresh token: %w", err)
+	}
+	return nil
 }
 
 func (p *PostgresStore) RevokeRefreshTokensForUser(ctx context.Context, userID string) error {

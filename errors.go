@@ -2,18 +2,7 @@ package auth
 
 import (
 	"encoding/json"
-	"errors"
 	"net/http"
-)
-
-var (
-	ErrTokenExpired      = errors.New("auth: token expired")
-	ErrTokenInvalid      = errors.New("auth: token invalid")
-	ErrTokenMissing      = errors.New("auth: token missing")
-	ErrRefreshRevoked    = errors.New("auth: refresh token revoked")
-	ErrLicenseInactive   = errors.New("auth: license not active")
-	ErrDeviceFlowPending = errors.New("auth: device flow authorization pending")
-	ErrDeviceFlowExpired = errors.New("auth: device flow session expired")
 )
 
 // AuthError is a structured error returned to clients.

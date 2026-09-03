@@ -1,165 +1,173 @@
 package auth
 
 import (
-	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
+	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/workos/workos-go/v10"
 )
 
-const (
-	defaultAccessTTL  = 15 * time.Minute
-	defaultRefreshTTL = 7 * 24 * time.Hour
-)
+const defaultRefreshTTL = 7 * 24 * time.Hour
 
 // Config configures the auth service.
 type Config struct {
-	WorkOSAPIKey    string
-	WorkOSClientID  string
-	JWTSigningKey   []byte
-	AccessTokenTTL  time.Duration // defaults to 15 minutes
-	RefreshTokenTTL time.Duration // defaults to 7 days
-	UpgradeURL      string        // included in tier_insufficient errors
-	OAuthRedirectURI string       // e.g., "https://yourdomain.com/auth/oauth/callback"
+	WorkOSAPIKey     string
+	WorkOSClientID   string
+	OAuthRedirectURI string // e.g., "https://app.llmlens.com/auth/oauth/callback"
+	UpgradeURL       string // included in tier_insufficient errors
+	Logger           *slog.Logger
 }
 
 // Service is the auth facade. Server components interact with this only.
 type Service struct {
-	jwt        *jwtService
-	workos     *workosClient
-	device     *deviceFlowService
-	store      Store
-	config     Config
+	workos *workos.Client
+	store  Store
+	config Config
+	log    *slog.Logger
 }
 
 // NewService creates a new auth service.
 func NewService(cfg Config, store Store) *Service {
-	if cfg.AccessTokenTTL == 0 {
-		cfg.AccessTokenTTL = defaultAccessTTL
+	client := workos.NewClient(cfg.WorkOSAPIKey, workos.WithClientID(cfg.WorkOSClientID))
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
 	}
-	if cfg.RefreshTokenTTL == 0 {
-		cfg.RefreshTokenTTL = defaultRefreshTTL
-	}
-
-	jwtSvc := newJWTService(cfg.JWTSigningKey, cfg.AccessTokenTTL, cfg.RefreshTokenTTL)
-	workosSvc := newWorkOSClient(cfg.WorkOSAPIKey, cfg.WorkOSClientID)
-
-	s := &Service{
-		jwt:    jwtSvc,
-		workos: workosSvc,
+	return &Service{
+		workos: client,
 		store:  store,
 		config: cfg,
+		log:    logger,
 	}
-	s.device = newDeviceFlowService(store, jwtSvc, workosSvc)
-	return s
 }
 
-// --- Device flow handlers ---
+// resolveAndStoreRefresh is the shared post-authentication logic:
+// maps a WorkOS user to an internal identity and stores the refresh token hash.
+func (s *Service) resolveAndStoreRefresh(r *http.Request, authResp *workos.AuthenticateResponse) (*Identity, error) {
+	if authResp.User == nil {
+		return nil, errors.New("auth: workos response missing user")
+	}
+
+	userID, err := s.store.GetOrCreateUser(r.Context(), authResp.User.ID, authResp.User.Email)
+	if err != nil {
+		return nil, err
+	}
+
+	identity, err := s.store.ResolveIdentity(r.Context(), userID)
+	if err != nil {
+		return nil, err
+	}
+
+	refreshHash := hashToken(authResp.RefreshToken)
+	if err := s.store.StoreRefreshToken(r.Context(), &RefreshToken{
+		TokenHash: refreshHash,
+		UserID:    identity.UserID,
+		LicenseID: identity.LicenseID,
+		ExpiresAt: time.Now().Add(defaultRefreshTTL),
+		CreatedAt: time.Now(),
+	}); err != nil {
+		s.log.Error("failed to store refresh token", "user_id", identity.UserID, "error", err)
+	}
+
+	return identity, nil
+}
 
 // HandleDeviceCodeRequest handles POST /auth/device/code.
+// The CLI calls this to start the device authorization flow.
 func (s *Service) HandleDeviceCodeRequest(w http.ResponseWriter, r *http.Request) {
-	s.device.handleCodeRequest(w, r)
+	resp, err := s.workos.AuthKitStartDeviceAuthorization(r.Context())
+	if err != nil {
+		s.log.Error("failed to start device authorization", "error", err)
+		http.Error(w, `{"error":"failed to start device authorization"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 // HandleDeviceToken handles POST /auth/device/token.
+// The CLI polls this until the user completes the browser flow.
 func (s *Service) HandleDeviceToken(w http.ResponseWriter, r *http.Request) {
-	s.device.handleToken(w, r)
-}
-
-// HandleDeviceVerify handles GET /auth/device/verify.
-// This renders a page where the user enters their device code,
-// then redirects them to WorkOS for authentication.
-func (s *Service) HandleDeviceVerify(w http.ResponseWriter, r *http.Request) {
-	userCode := r.URL.Query().Get("code")
-	if userCode == "" {
-		// Render a page with an input field for the user code.
-		// In production this would be a proper template.
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprint(w, deviceVerifyHTML)
+	var req struct {
+		DeviceCode string  `json:"device_code"`
+		Interval   float64 `json:"interval"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
 		return
 	}
 
-	// Validate the user code exists and is pending.
-	session, err := s.store.GetDeviceFlowByUserCode(r.Context(), userCode)
-	if err != nil || session.Status != "pending" || time.Now().After(session.ExpiresAt) {
-		http.Error(w, "Invalid or expired code", http.StatusBadRequest)
-		return
+	interval := 5
+	if req.Interval > 0 {
+		interval = int(req.Interval)
 	}
 
-	// Redirect to WorkOS for authentication.
-	// Pass the device_code in state so the callback can complete the flow.
-	authURL, err := s.workos.getAuthorizationURL(s.config.OAuthRedirectURI, session.DeviceCode)
+	authResp, err := s.workos.AuthKitPollDeviceCode(r.Context(), req.DeviceCode, interval)
 	if err != nil {
-		http.Error(w, "Failed to initiate authentication", http.StatusInternalServerError)
+		// Differentiate WorkOS error types.
+		var authErr *workos.AuthenticationError
+		if errors.As(err, &authErr) {
+			// 401 from WorkOS means pending or expired — relay the status.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			json.NewEncoder(w).Encode(map[string]string{"status": "authorization_pending"})
+			return
+		}
+		s.log.Error("device code poll failed", "error", err)
+		http.Error(w, `{"error":"device authorization failed"}`, http.StatusInternalServerError)
 		return
 	}
 
-	http.Redirect(w, r, authURL, http.StatusFound)
+	identity, err := s.resolveAndStoreRefresh(r, authResp)
+	if err != nil {
+		s.log.Error("failed to resolve identity after device auth", "error", err)
+		http.Error(w, `{"error":"failed to resolve identity"}`, http.StatusInternalServerError)
+		return
+	}
+	_ = identity // identity resolved successfully; tokens are from WorkOS
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(TokenResponse{
+		AccessToken:  authResp.AccessToken,
+		RefreshToken: authResp.RefreshToken,
+	})
 }
 
 // HandleOAuthCallback handles GET /auth/oauth/callback.
-// This is called by WorkOS after the user authenticates.
-// It works for both dashboard login and device flow completion.
+// Called by WorkOS after browser-based authentication (dashboard login).
 func (s *Service) HandleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
-	state := r.URL.Query().Get("state")
-
 	if code == "" {
 		http.Error(w, "Missing authorization code", http.StatusBadRequest)
 		return
 	}
 
-	// Exchange the code for a WorkOS user.
-	workosID, email, err := s.workos.exchangeCode(r.Context(), code)
+	authResp, err := s.workos.UserManagement().AuthenticateWithCode(r.Context(), &workos.UserManagementAuthenticateWithCodeParams{
+		Code: code,
+	})
 	if err != nil {
+		s.log.Error("workos code exchange failed", "error", err)
 		http.Error(w, "Authentication failed", http.StatusUnauthorized)
 		return
 	}
 
-	// Get or create the internal user.
-	userID, err := s.store.GetOrCreateUser(r.Context(), workosID, email)
+	identity, err := s.resolveAndStoreRefresh(r, authResp)
 	if err != nil {
-		http.Error(w, "Failed to resolve user", http.StatusInternalServerError)
-		return
-	}
-
-	// If state contains a device_code, this is a device flow completion.
-	if state != "" {
-		session, err := s.store.GetDeviceFlowByDeviceCode(r.Context(), state)
-		if err == nil && session.Status == "pending" {
-			_ = s.store.CompleteDeviceFlow(r.Context(), state, userID)
-			// Show success page — the CLI will pick up the token via polling.
-			w.Header().Set("Content-Type", "text/html")
-			fmt.Fprint(w, deviceFlowCompleteHTML)
-			return
-		}
-	}
-
-	// Dashboard login — issue tokens directly.
-	identity, err := s.store.ResolveIdentity(r.Context(), userID)
-	if err != nil {
+		s.log.Error("failed to resolve identity after oauth", "error", err)
 		http.Error(w, "Failed to resolve identity", http.StatusInternalServerError)
 		return
 	}
-
-	tokenPair, err := s.jwt.issue(identity, "")
-	if err != nil {
-		http.Error(w, "Failed to issue tokens", http.StatusInternalServerError)
-		return
-	}
-
-	refreshHash := hashRefreshToken(tokenPair.RefreshToken)
-	_ = s.store.StoreRefreshToken(r.Context(), &RefreshToken{
-		TokenHash: refreshHash,
-		UserID:    identity.UserID,
-		LicenseID: identity.LicenseID,
-		ExpiresAt: time.Now().Add(s.config.RefreshTokenTTL),
-		CreatedAt: time.Now(),
-	})
+	_ = identity
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(tokenPair)
+	json.NewEncoder(w).Encode(TokenResponse{
+		AccessToken:  authResp.AccessToken,
+		RefreshToken: authResp.RefreshToken,
+	})
 }
 
 // HandleRefresh handles POST /auth/refresh.
@@ -172,71 +180,51 @@ func (s *Service) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tokenHash := hashRefreshToken(req.RefreshToken)
+	// Check if refresh token has been revoked locally.
+	tokenHash := hashToken(req.RefreshToken)
 	stored, err := s.store.GetRefreshToken(r.Context(), tokenHash)
-	if err != nil {
-		(&AuthError{StatusCode: http.StatusUnauthorized, Error: "unauthorized", Reason: "invalid refresh token"}).Write(w)
-		return
-	}
-
-	if stored.RevokedAt != nil {
+	if err == nil && stored.RevokedAt != nil {
 		(&AuthError{StatusCode: http.StatusUnauthorized, Error: "unauthorized", Reason: "refresh token revoked"}).Write(w)
 		return
 	}
 
-	if time.Now().After(stored.ExpiresAt) {
-		(&AuthError{StatusCode: http.StatusUnauthorized, Error: "unauthorized", Reason: "refresh token expired"}).Write(w)
+	// Exchange with WorkOS for new tokens.
+	authResp, err := s.workos.UserManagement().AuthenticateWithRefreshToken(r.Context(), &workos.UserManagementAuthenticateWithRefreshTokenParams{
+		RefreshToken: req.RefreshToken,
+	})
+	if err != nil {
+		s.log.Error("workos refresh token exchange failed", "error", err)
+		(&AuthError{StatusCode: http.StatusUnauthorized, Error: "unauthorized", Reason: "invalid refresh token"}).Write(w)
 		return
 	}
 
-	// Re-resolve identity (picks up plan changes, scope changes).
-	identity, err := s.store.ResolveIdentity(r.Context(), stored.UserID)
+	// Revoke old token in our DB.
+	if stored != nil {
+		if err := s.store.RevokeRefreshToken(r.Context(), stored.TokenHash); err != nil {
+			s.log.Error("failed to revoke old refresh token", "error", err)
+		}
+	}
+
+	// Store new refresh token and re-resolve identity (picks up plan changes).
+	identity, err := s.resolveAndStoreRefresh(r, authResp)
 	if err != nil {
+		s.log.Error("failed to resolve identity after refresh", "error", err)
 		http.Error(w, `{"error":"failed to resolve identity"}`, http.StatusInternalServerError)
 		return
 	}
-
-	tokenPair, err := s.jwt.issue(identity, stored.DeviceFingerprint)
-	if err != nil {
-		http.Error(w, `{"error":"failed to issue token"}`, http.StatusInternalServerError)
-		return
-	}
-
-	// Rotate refresh token: revoke old, store new.
-	_ = s.revokeAndStoreRefresh(r.Context(), stored, tokenPair, identity)
+	_ = identity
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(tokenPair)
-}
-
-func (s *Service) revokeAndStoreRefresh(ctx context.Context, old *RefreshToken, newPair *TokenPair, identity *Identity) error {
-	now := time.Now()
-	old.RevokedAt = &now
-
-	newHash := hashRefreshToken(newPair.RefreshToken)
-	return s.store.StoreRefreshToken(ctx, &RefreshToken{
-		TokenHash:         newHash,
-		UserID:            identity.UserID,
-		LicenseID:         identity.LicenseID,
-		DeviceFingerprint: old.DeviceFingerprint,
-		ExpiresAt:         time.Now().Add(s.config.RefreshTokenTTL),
-		CreatedAt:         time.Now(),
+	json.NewEncoder(w).Encode(TokenResponse{
+		AccessToken:  authResp.AccessToken,
+		RefreshToken: authResp.RefreshToken,
 	})
 }
 
-// Minimal HTML templates — in production, replace with proper templates.
-const deviceVerifyHTML = `<!DOCTYPE html>
-<html><body>
-<h1>Device Authorization</h1>
-<form method="GET">
-  <label>Enter the code shown on your device:</label><br>
-  <input type="text" name="code" placeholder="ABCD-1234" style="font-size:1.5em;letter-spacing:0.1em" />
-  <button type="submit">Continue</button>
-</form>
-</body></html>`
-
-const deviceFlowCompleteHTML = `<!DOCTYPE html>
-<html><body>
-<h1>Device Authorized</h1>
-<p>You can close this window and return to your terminal.</p>
-</body></html>`
+// GetAuthorizationURL returns the WorkOS OAuth URL for browser-based login.
+func (s *Service) GetAuthorizationURL(state string) (string, error) {
+	return s.workos.GetAuthKitAuthorizationURL(workos.AuthKitAuthorizationURLParams{
+		RedirectURI: s.config.OAuthRedirectURI,
+		State:       &state,
+	})
+}

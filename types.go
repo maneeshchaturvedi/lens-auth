@@ -14,15 +14,6 @@ const (
 	PlanTeam Plan = "team"
 )
 
-// LicenseStatus represents the state of a license.
-type LicenseStatus string
-
-const (
-	StatusActive    LicenseStatus = "active"
-	StatusExpired   LicenseStatus = "expired"
-	StatusCancelled LicenseStatus = "cancelled"
-)
-
 // Scope represents a fine-grained permission.
 type Scope string
 
@@ -49,35 +40,10 @@ func (id *Identity) HasScope(s Scope) bool {
 	return slices.Contains(id.Scopes, s)
 }
 
-// Claims are the JWT payload issued by this library.
-type Claims struct {
-	UserID    string  `json:"sub"`
-	Email     string  `json:"email"`
-	OrgID     string  `json:"org_id,omitempty"`
-	LicenseID string  `json:"license_id"`
-	Plan      Plan    `json:"plan"`
-	Scopes    []Scope `json:"scopes"`
-	DeviceID  string  `json:"device_id,omitempty"`
-}
-
-// TokenPair is returned to clients after successful authentication.
-type TokenPair struct {
+// TokenResponse is returned to clients after successful authentication.
+type TokenResponse struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
-	ExpiresIn    int    `json:"expires_in"`
-}
-
-// DeviceFlowSession tracks a pending device authorization request.
-type DeviceFlowSession struct {
-	ID                string
-	DeviceCode        string
-	UserCode          string
-	DeviceFingerprint string
-	DeviceName        string
-	Status            string // "pending", "complete", "expired"
-	UserID            string // populated on completion
-	ExpiresAt         time.Time
-	CreatedAt         time.Time
 }
 
 // RefreshToken is stored server-side for revocation support.

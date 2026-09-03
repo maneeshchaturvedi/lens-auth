@@ -4,6 +4,9 @@ import (
 	"context"
 	"net/http"
 	"strings"
+
+	"github.com/MicahParks/keyfunc/v3"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 type contextKey struct{ name string }
@@ -11,7 +14,6 @@ type contextKey struct{ name string }
 var identityKey = &contextKey{"identity"}
 
 // IdentityFrom extracts the Identity from the request context.
-// Returns nil if no identity is present (i.e., middleware was not applied).
 func IdentityFrom(ctx context.Context) *Identity {
 	id, _ := ctx.Value(identityKey).(*Identity)
 	return id
@@ -21,13 +23,30 @@ func withIdentity(ctx context.Context, id *Identity) context.Context {
 	return context.WithValue(ctx, identityKey, id)
 }
 
-// Middleware returns HTTP middleware that validates the bearer token
-// and injects the Identity into the request context.
+// Middleware returns HTTP middleware that:
+// 1. Validates the WorkOS access token (JWT) via JWKS
+// 2. Resolves the user's identity (license, tier, scopes) from the DB
+// 3. Injects Identity into the request context
 func (s *Service) Middleware() func(http.Handler) http.Handler {
+	jwksURL := s.workos.JWKSURLFromClient()
+	jwks, err := keyfunc.NewDefault([]string{jwksURL})
+	if err != nil {
+		s.log.Error("failed to initialize JWKS keyfunc, middleware will reject all requests", "jwks_url", jwksURL, "error", err)
+	}
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			token := extractBearer(r)
-			if token == "" {
+			if jwks == nil {
+				(&AuthError{
+					StatusCode: http.StatusServiceUnavailable,
+					Error:      "service_unavailable",
+					Reason:     "authentication service not initialized",
+				}).Write(w)
+				return
+			}
+
+			tokenStr := extractBearer(r)
+			if tokenStr == "" {
 				(&AuthError{
 					StatusCode: http.StatusUnauthorized,
 					Error:      "unauthorized",
@@ -36,23 +55,68 @@ func (s *Service) Middleware() func(http.Handler) http.Handler {
 				return
 			}
 
-			claims, err := s.jwt.validate(token)
-			if err != nil {
+			// Validate the WorkOS JWT using the request context.
+			token, err := jwt.Parse(tokenStr, jwks.KeyfuncCtx(r.Context()))
+			if err != nil || !token.Valid {
 				(&AuthError{
 					StatusCode: http.StatusUnauthorized,
 					Error:      "unauthorized",
-					Reason:     err.Error(),
+					Reason:     "invalid token",
 				}).Write(w)
 				return
 			}
 
-			identity := &Identity{
-				UserID:    claims.UserID,
-				Email:     claims.Email,
-				OrgID:     claims.OrgID,
-				LicenseID: claims.LicenseID,
-				Plan:      claims.Plan,
-				Scopes:    claims.Scopes,
+			claims, ok := token.Claims.(jwt.MapClaims)
+			if !ok {
+				(&AuthError{
+					StatusCode: http.StatusUnauthorized,
+					Error:      "unauthorized",
+					Reason:     "invalid token claims",
+				}).Write(w)
+				return
+			}
+
+			workosUserID, _ := claims["sub"].(string)
+			if workosUserID == "" {
+				(&AuthError{
+					StatusCode: http.StatusUnauthorized,
+					Error:      "unauthorized",
+					Reason:     "missing subject claim",
+				}).Write(w)
+				return
+			}
+
+			email, _ := claims["email"].(string)
+			if email == "" {
+				(&AuthError{
+					StatusCode: http.StatusUnauthorized,
+					Error:      "unauthorized",
+					Reason:     "missing email claim",
+				}).Write(w)
+				return
+			}
+
+			// Resolve internal identity: user → license → tier → scopes.
+			userID, err := s.store.GetOrCreateUser(r.Context(), workosUserID, email)
+			if err != nil {
+				s.log.Error("failed to resolve user", "workos_user_id", workosUserID, "error", err)
+				(&AuthError{
+					StatusCode: http.StatusInternalServerError,
+					Error:      "internal_error",
+					Reason:     "failed to resolve user",
+				}).Write(w)
+				return
+			}
+
+			identity, err := s.store.ResolveIdentity(r.Context(), userID)
+			if err != nil {
+				s.log.Warn("no active license for user", "user_id", userID, "error", err)
+				(&AuthError{
+					StatusCode: http.StatusForbidden,
+					Error:      "forbidden",
+					Reason:     "no active license",
+				}).Write(w)
+				return
 			}
 
 			ctx := withIdentity(r.Context(), identity)
@@ -62,7 +126,6 @@ func (s *Service) Middleware() func(http.Handler) http.Handler {
 }
 
 // RequireScope returns middleware that checks for a specific scope.
-// Must be chained after Service.Middleware().
 func RequireScope(scope Scope) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -87,7 +150,6 @@ func RequireScope(scope Scope) func(http.Handler) http.Handler {
 	}
 }
 
-// minPlanForScope returns the cheapest plan that grants a given scope.
 func minPlanForScope(scope Scope) Plan {
 	for _, plan := range []Plan{PlanFree, PlanPro, PlanTeam} {
 		for _, s := range PlanScopes[plan] {
@@ -96,7 +158,7 @@ func minPlanForScope(scope Scope) Plan {
 			}
 		}
 	}
-	return PlanPro // fallback
+	return PlanPro
 }
 
 func extractBearer(r *http.Request) string {
@@ -106,3 +168,4 @@ func extractBearer(r *http.Request) string {
 	}
 	return strings.TrimPrefix(auth, "Bearer ")
 }
+
