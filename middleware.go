@@ -86,15 +86,20 @@ func (s *Service) Middleware() func(http.Handler) http.Handler {
 				return
 			}
 
-			email, _ := claims["email"].(string)
-			if email == "" {
+			// Resolve email from WorkOS User Management API using sub claim.
+			// Access tokens don't include email — it's fetched from the user profile.
+			user, err := s.workos.UserManagement().Get(r.Context(), workosUserID)
+			if err != nil {
+				s.log.Error("failed to fetch WorkOS user", "workos_user_id", workosUserID, "error", err)
 				(&AuthError{
-					StatusCode: http.StatusUnauthorized,
-					Error:      "unauthorized",
-					Reason:     "missing email claim",
+					StatusCode: http.StatusInternalServerError,
+					Error:      "internal_error",
+					Reason:     "failed to resolve user profile",
 				}).Write(w)
 				return
 			}
+
+			email := user.Email
 
 			// Resolve internal identity: user → license → tier → scopes.
 			userID, err := s.store.GetOrCreateUser(r.Context(), workosUserID, email)
