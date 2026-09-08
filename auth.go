@@ -108,10 +108,10 @@ func (s *Service) HandleDeviceToken(w http.ResponseWriter, r *http.Request) {
 
 	authResp, err := s.workos.AuthKitPollDeviceCode(r.Context(), req.DeviceCode, interval)
 	if err != nil {
-		// Differentiate WorkOS error types.
-		var authErr *workos.AuthenticationError
-		if errors.As(err, &authErr) {
-			// 401 from WorkOS means pending or expired — relay the status.
+		// WorkOS returns a 400 APIError with code "authorization_pending"
+		// while the user hasn't approved yet — relay as 202 to the CLI.
+		var apiErr *workos.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode == "authorization_pending" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusAccepted)
 			json.NewEncoder(w).Encode(map[string]string{"status": "authorization_pending"})
