@@ -80,6 +80,7 @@ func (p *PostgresStore) StoreRefreshToken(ctx context.Context, token *RefreshTok
 	_, err := p.pool.Exec(ctx, `
 		INSERT INTO llmlens.refresh_tokens (token_hash, user_id, license_id, device_fingerprint, expires_at, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (token_hash) DO UPDATE SET expires_at = EXCLUDED.expires_at
 	`, token.TokenHash, token.UserID, token.LicenseID, token.DeviceFingerprint,
 		token.ExpiresAt, token.CreatedAt)
 	if err != nil {
