@@ -5,6 +5,7 @@ package auth
 var PlanScopes = map[Plan][]Scope{
 	PlanFree: {
 		ScopeDashboardRead,
+		ScopeCLI,
 	},
 	PlanPro: {
 		ScopeDashboardRead,
