@@ -14,10 +14,6 @@ type Store interface {
 	// Returns the internal user ID.
 	GetOrCreateUser(ctx context.Context, workosID, email string) (string, error)
 
-	// Device tracking.
-	RegisterDevice(ctx context.Context, licenseID, fingerprint, name, email string) error
-	UpdateDeviceLastSeen(ctx context.Context, licenseID, fingerprint string) error
-
 	// Refresh token management (stored server-side for revocation).
 	StoreRefreshToken(ctx context.Context, token *RefreshToken) error
 	GetRefreshToken(ctx context.Context, tokenHash string) (*RefreshToken, error)
