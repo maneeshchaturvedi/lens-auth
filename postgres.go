@@ -52,30 +52,6 @@ func (p *PostgresStore) GetOrCreateUser(ctx context.Context, workosID, email str
 	return userID, nil
 }
 
-func (p *PostgresStore) RegisterDevice(ctx context.Context, licenseID, fingerprint, name, email string) error {
-	_, err := p.pool.Exec(ctx, `
-		INSERT INTO llmlens.license_devices (license_id, device_fingerprint, device_name, user_email, activated_at, last_seen_at)
-		VALUES ($1, $2, $3, $4, NOW(), NOW())
-		ON CONFLICT (license_id, device_fingerprint)
-		DO UPDATE SET device_name = EXCLUDED.device_name, last_seen_at = NOW()
-	`, licenseID, fingerprint, name, email)
-	if err != nil {
-		return fmt.Errorf("auth: register device: %w", err)
-	}
-	return nil
-}
-
-func (p *PostgresStore) UpdateDeviceLastSeen(ctx context.Context, licenseID, fingerprint string) error {
-	_, err := p.pool.Exec(ctx, `
-		UPDATE llmlens.license_devices SET last_seen_at = NOW()
-		WHERE license_id = $1 AND device_fingerprint = $2
-	`, licenseID, fingerprint)
-	if err != nil {
-		return fmt.Errorf("auth: update device last seen: %w", err)
-	}
-	return nil
-}
-
 func (p *PostgresStore) StoreRefreshToken(ctx context.Context, token *RefreshToken) error {
 	_, err := p.pool.Exec(ctx, `
 		INSERT INTO llmlens.refresh_tokens (token_hash, user_id, license_id, device_fingerprint, expires_at, created_at)
