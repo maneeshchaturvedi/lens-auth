@@ -18,6 +18,13 @@ func NewPostgresStore(pool *pgxpool.Pool) *PostgresStore {
 	return &PostgresStore{pool: pool}
 }
 
+// usableLicense matches a license l that grants access: active and within
+// any fixed term, or cancelled but still inside the period already paid for.
+// The license server's expiry sweep later marks lapsed ones expired; access
+// does not wait for it.
+const usableLicense = `(l.expires_at IS NULL OR l.expires_at > NOW())
+		  AND (l.status = 'active' OR (l.status = 'cancelled' AND l.expires_at IS NOT NULL))`
+
 func (p *PostgresStore) ResolveIdentity(ctx context.Context, userID string) (*Identity, error) {
 	var id Identity
 	var plan string
@@ -25,7 +32,7 @@ func (p *PostgresStore) ResolveIdentity(ctx context.Context, userID string) (*Id
 		SELECT u.id, u.email, l.id, l.plan, COALESCE(l.org_name, '')
 		FROM llmlens.users u
 		JOIN llmlens.licenses l ON l.email = u.email
-		WHERE u.id = $1 AND l.status = 'active'
+		WHERE u.id = $1 AND `+usableLicense+`
 		ORDER BY l.created_at DESC
 		LIMIT 1
 	`, userID).Scan(&id.UserID, &id.Email, &id.LicenseID, &plan, &id.OrgID)
